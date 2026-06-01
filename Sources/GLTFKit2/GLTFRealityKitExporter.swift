@@ -64,10 +64,8 @@ public class GLTFRealityKitExporter {
             wn.scale       = t.scale
 
             if let me = e as? ModelEntity, let model = me.model {
-                let worldTransform = me.transformMatrix(relativeTo: nil)
                 wn.meshParts = try buildMeshParts(
                     model: model,
-                    worldTransform: worldTransform,
                     rkMaterials: model.materials,
                     materialList: &materials,
                     cache: &materialCache
@@ -88,19 +86,10 @@ public class GLTFRealityKitExporter {
 
     private func buildMeshParts(
         model: ModelComponent,
-        worldTransform: simd_float4x4,
         rkMaterials: [any Material],
         materialList: inout [GLTFWriterMaterial],
         cache: inout [ObjectIdentifier: Int]
     ) throws -> [GLTFWriterMeshPart] {
-
-        var normalMatrix: simd_float3x3 {
-            simd_float3x3(
-                SIMD3<Float>(worldTransform[0].x, worldTransform[0].y, worldTransform[0].z),
-                SIMD3<Float>(worldTransform[1].x, worldTransform[1].y, worldTransform[1].z),
-                SIMD3<Float>(worldTransform[2].x, worldTransform[2].y, worldTransform[2].z)
-            )
-        }
 
         var parts: [GLTFWriterMeshPart] = []
 
@@ -109,20 +98,14 @@ public class GLTFRealityKitExporter {
                 let positions = part.positions.elements
                 guard !positions.isEmpty, let indexBuf = part.triangleIndices else { continue }
 
-                let nm = normalMatrix
-                let worldPositions = positions.map { p -> SIMD3<Float> in
-                    let wp = worldTransform * SIMD4<Float>(p.x, p.y, p.z, 1)
-                    return SIMD3<Float>(wp.x, wp.y, wp.z)
-                }
-
                 let wp = GLTFWriterMeshPart()
                 // SIMD3<Float> has 16-byte stride in memory — must compact to 12-byte packed float3.
-                wp.positionData = packFloat3(worldPositions)
+                // Positions and normals are in local mesh space; the node's TRS handles world placement.
+                wp.positionData = packFloat3(positions)
                 wp.vertexCount  = UInt(positions.count)
 
                 if let normals = part.normals?.elements, normals.count == positions.count {
-                    let worldNormals = normals.map { normalize(nm * $0) }
-                    wp.normalData = packFloat3(worldNormals)
+                    wp.normalData = packFloat3(normals)
                 }
 
                 if let uvs = part.textureCoordinates?.elements, uvs.count == positions.count {
