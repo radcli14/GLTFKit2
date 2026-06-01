@@ -256,7 +256,10 @@ public class GLTFRealityKitExporter {
         #endif
 
         let bpr  = 4 * resource.width
-        var bytes = [UInt8](repeating: 0, count: resource.height * bpr)
+        // Pre-fill with 255 so that alpha defaults to fully opaque if the source texture has no
+        // alpha channel and resource.copy(to:) leaves those bytes unwritten.
+        // If the texture does have real transparency, the copy overwrites these with actual values.
+        var bytes = [UInt8](repeating: 255, count: resource.height * bpr)
         bytes.withUnsafeMutableBytes { ptr in
             tex.getBytes(ptr.baseAddress!,
                          bytesPerRow: bpr,
@@ -313,7 +316,7 @@ public class GLTFRealityKitExporter {
         }
         #endif
         let bpr = 4 * resource.width
-        var bytes = [UInt8](repeating: 0, count: resource.height * bpr)
+        var bytes = [UInt8](repeating: 255, count: resource.height * bpr)
         bytes.withUnsafeMutableBytes { ptr in
             tex.getBytes(ptr.baseAddress!, bytesPerRow: bpr,
                 from: MTLRegion(origin: .init(), size: MTLSize(width: resource.width, height: resource.height, depth: 1)),
@@ -329,7 +332,7 @@ public class GLTFRealityKitExporter {
                   width: width, height: height,
                   bitsPerComponent: 8, bitsPerPixel: 32, bytesPerRow: bpr,
                   space: colorSpace,
-                  bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue),
+                  bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.last.rawValue),
                   provider: provider, decode: nil, shouldInterpolate: false, intent: .defaultIntent)
         else { return nil }
 
