@@ -270,8 +270,8 @@ static void flattenNodes(GLTFWriterNode *node, NSMutableArray<GLTFWriterNode *> 
     // 7. Default sampler.
     // -----------------------------------------------------------------------
     if (samplers) {
-        samplers[0].wrap_s    = 33071; // GL_CLAMP_TO_EDGE
-        samplers[0].wrap_t    = 33071;
+        samplers[0].wrap_s    = 10497; // GL_REPEAT (GLTF default; preserves tiling for UVs outside [0,1])
+        samplers[0].wrap_t    = 10497;
         samplers[0].min_filter = 9729; // GL_LINEAR
         samplers[0].mag_filter = 9729;
     }
