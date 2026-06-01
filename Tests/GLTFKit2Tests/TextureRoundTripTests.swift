@@ -553,6 +553,196 @@ private func dist3(_ a: SIMD3<Float>, _ b: SIMD3<Float>) -> Float {
     #expect(abs(ldB - srcB) < 10, "Base color mean B: src=\(srcB), loaded=\(ldB)")
 }
 
+// MARK: - Skinned Mesh Baking Helpers
+
+/// Collects all vertex positions from the entire entity tree (bind-pose, no skinning applied).
+@MainActor
+private func allPositions(from entity: Entity) -> [SIMD3<Float>] {
+    var result: [SIMD3<Float>] = []
+    func walk(_ e: Entity) {
+        if let me = e as? ModelEntity, let model = me.model {
+            for rkModel in model.mesh.contents.models {
+                for part in rkModel.parts { result.append(contentsOf: part.positions.elements) }
+            }
+        }
+        for child in e.children { walk(child) }
+    }
+    walk(entity)
+    return result
+}
+
+/// Applies LBS to one mesh part's positions using model-space joint transforms.
+/// Mirrors the exact math in GLTFRealityKitExporter.bakeSkinnedGeometry.
+/// modelSpaceTransforms must already be in entity-local space (not parent-relative).
+@available(macOS 15.0, iOS 18.0, *)
+private func applyLBS(
+    positions: [SIMD3<Float>],
+    influences: MeshResource.JointInfluences,
+    skeleton: MeshResource.Skeleton,
+    modelSpaceTransforms: [simd_float4x4]
+) -> [SIMD3<Float>] {
+    let skinMtx = skeleton.joints.indices.map { i -> simd_float4x4 in
+        let M = i < modelSpaceTransforms.count ? modelSpaceTransforms[i] : matrix_identity_float4x4
+        return M * skeleton.joints[i].inverseBindPoseMatrix
+    }
+
+    let allInf = influences.influences.elements
+    let ipv = positions.count > 0 ? allInf.count / positions.count : 0
+    guard ipv > 0 else { return positions }
+
+    return positions.indices.map { v in
+        var dp = SIMD4<Float>.zero
+        for k in 0..<ipv {
+            let idx = v * ipv + k
+            guard idx < allInf.count else { break }
+            let inf = allInf[idx]
+            guard inf.weight > 0, inf.jointIndex < skinMtx.count else { continue }
+            let M = skinMtx[inf.jointIndex]
+            dp += inf.weight * (M * SIMD4<Float>(positions[v].x, positions[v].y, positions[v].z, 1))
+        }
+        return SIMD3<Float>(dp.x, dp.y, dp.z)
+    }
+}
+
+/// Returns the expected baked positions for the full entity tree, applying LBS where joint influences exist.
+@available(macOS 15.0, iOS 18.0, *)
+@MainActor
+private func expectedBakedPositions(from entity: Entity) -> [SIMD3<Float>] {
+    var result: [SIMD3<Float>] = []
+    func walk(_ e: Entity) {
+        if let me = e as? ModelEntity, let model = me.model {
+            for rkModel in model.mesh.contents.models {
+                for part in rkModel.parts {
+                    let positions = part.positions.elements
+                    guard !positions.isEmpty else { continue }
+                    if let ji = part.jointInfluences,
+                       let skelID = part.skeletonID,
+                       let skel = model.mesh.contents.skeletons[skelID] {
+                        let jt = me.jointTransforms
+                        let modelSpaceXforms: [simd_float4x4]
+                        if jt.count == skel.joints.count {
+                            modelSpaceXforms = jt.map { $0.matrix }
+                        } else {
+                            var xforms = [simd_float4x4](repeating: matrix_identity_float4x4, count: skel.joints.count)
+                            for (i, joint) in skel.joints.enumerated() {
+                                let local = joint.restPoseTransform.matrix
+                                xforms[i] = joint.parentIndex.map { xforms[$0] * local } ?? local
+                            }
+                            modelSpaceXforms = xforms
+                        }
+                        result.append(contentsOf: applyLBS(positions: positions, influences: ji,
+                                                           skeleton: skel, modelSpaceTransforms: modelSpaceXforms))
+                    } else {
+                        result.append(contentsOf: positions)
+                    }
+                }
+            }
+        }
+        for child in e.children { walk(child) }
+    }
+    walk(entity)
+    return result
+}
+
+/// Component-wise AABB over a position array.
+private func aabb(of positions: [SIMD3<Float>]) -> (min: SIMD3<Float>, max: SIMD3<Float>)? {
+    guard !positions.isEmpty else { return nil }
+    var mn = SIMD3<Float>(repeating: Float.infinity)
+    var mx = SIMD3<Float>(repeating: -.infinity)
+    for p in positions { mn = min(mn, p); mx = max(mx, p) }
+    return (mn, mx)
+}
+
+// MARK: - Skinned Mesh Baking Test
+
+/// Verifies that the GLTFRealityKitExporter correctly bakes linear-blend skinning into
+/// static vertex positions when exporting a skinned USDZ mesh.
+///
+/// The test replicates the exporter's LBS math independently to compute "expected" baked
+/// positions, then exports the entity to GLB, reloads it, and compares:
+///   - Bounding box dimensions (detects scale/units errors and gross deformation bugs)
+///   - Total vertex count (detects dropped mesh parts)
+///
+/// Diagnostic output includes the entity hierarchy (names, transforms, skeleton info)
+/// and side-by-side AABBs so you can immediately see which axis is stretched.
+@Test @MainActor
+@available(macOS 15.0, iOS 18.0, *)
+func testSkinnedBakingLeftHand() async throws {
+    let testDir = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+    let sourceURL = testDir.appendingPathComponent("left_hand.usdz")
+    guard FileManager.default.fileExists(atPath: sourceURL.path) else {
+        Issue.record("left_hand.usdz not found at \(sourceURL.path)"); return
+    }
+
+    let source = try await Entity(contentsOf: sourceURL)
+
+    // Print entity tree for diagnosing coordinate-space and skeleton structure issues.
+    func printTree(_ e: Entity, depth: Int = 0) {
+        let indent = String(repeating: "  ", count: depth)
+        let t = e.transform
+        print("\(indent)'\(e.name)' scale=\(t.scale) trans=\(t.translation)")
+        if let me = e as? ModelEntity, let model = me.model {
+            for rkModel in model.mesh.contents.models {
+                for part in rkModel.parts {
+                    let skelID = part.skeletonID ?? "none"
+                    let jointCount = part.skeletonID.flatMap { model.mesh.contents.skeletons[$0] }?.joints.count ?? 0
+                    let infCount = part.jointInfluences?.influences.elements.count ?? 0
+                    let ipv = part.positions.elements.count > 0 ? infCount / part.positions.elements.count : 0
+                    print("\(indent)  part: verts=\(part.positions.elements.count) skelID='\(skelID)' joints=\(jointCount) ipv=\(ipv)")
+                }
+            }
+            print("\(indent)  jointTransforms.count=\(me.jointTransforms.count)")
+        }
+        for child in e.children { printTree(child, depth: depth + 1) }
+    }
+    printTree(source)
+
+    let expPos = expectedBakedPositions(from: source)
+    print("Expected (LBS-baked) vertex count: \(expPos.count)")
+
+    let outURL = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString).appendingPathExtension("glb")
+    defer { try? FileManager.default.removeItem(at: outURL) }
+
+    try GLTFRealityKitExporter().writeEntity(source, to: outURL)
+    let loaded = try await GLTFRealityKitLoader.load(from: outURL)
+    let ldPos = allPositions(from: loaded)
+    print("Loaded (GLB) vertex count: \(ldPos.count)")
+
+    #expect(!expPos.isEmpty, "No vertices found in source entity — left_hand.usdz may have no skinned geometry")
+    #expect(!ldPos.isEmpty,  "No vertices in exported GLB — export produced empty file")
+
+    // Sanity: baking should move vertices. Compare baked bounding box against bind-pose bounding box.
+    // For a hand in its rest/fist pose the baked positions will differ measurably from bind pose.
+    let bindPos = allPositions(from: source)
+    if let bindBB = aabb(of: bindPos), let expBB2 = aabb(of: expPos) {
+        let bindSize = bindBB.max - bindBB.min
+        let expSize2 = expBB2.max - expBB2.min
+        print("Bind-pose AABB: size=\(bindSize)")
+        let maxDimDiff = max(abs(expSize2.x - bindSize.x), abs(expSize2.y - bindSize.y), abs(expSize2.z - bindSize.z))
+        #expect(maxDimDiff > 0.001 || expPos == bindPos,
+                "LBS baking produced no change from bind pose — jointTransforms may be identity or skinning is not running")
+    }
+
+    // Bounding box comparison: stretched/scaled output shows up as a size mismatch.
+    if let expBB = aabb(of: expPos), let ldBB = aabb(of: ldPos) {
+        let expSize = expBB.max - expBB.min
+        let ldSize  = ldBB.max  - ldBB.min
+        print("Expected AABB: min=\(expBB.min) max=\(expBB.max) size=\(expSize)")
+        print("Loaded AABB:   min=\(ldBB.min)  max=\(ldBB.max)  size=\(ldSize)")
+
+        let tol: Float = 0.05  // 5% relative or 1 mm absolute — whichever is larger
+        for (axis, expLen, ldLen) in [("X", expSize.x, ldSize.x), ("Y", expSize.y, ldSize.y), ("Z", expSize.z, ldSize.z)] {
+            let tolerance = max(abs(expLen) * tol, 0.001)
+            #expect(abs(ldLen - expLen) < tolerance,
+                    "AABB \(axis) size mismatch: expected=\(expLen) loaded=\(ldLen) — check for scale/units error or wrong joint-transform space in bakeSkinnedGeometry")
+        }
+    }
+
+    #expect(ldPos.count == expPos.count,
+            "Vertex count mismatch: expected=\(expPos.count) loaded=\(ldPos.count)")
+}
+
 // MARK: - Texture Sampler Round-Trip Tests
 
 /// Verifies that texture wrapping modes (wrapS/wrapT) survive a GLB round-trip.

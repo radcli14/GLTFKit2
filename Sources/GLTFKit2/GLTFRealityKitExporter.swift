@@ -168,15 +168,19 @@ public class GLTFRealityKitExporter {
             return (positions, normals)
         }
 
-        // Use the entity's current joint transforms when available (e.g. dynamically posed entity).
-        // Each transform is parent-relative (local joint space), ordered parents-before-children.
-        // Fall back to skeleton rest pose for static models where jointTransforms is empty.
+        // RealityKit's jointTransforms are already in entity-local (model) space — use directly.
+        // restPoseTransform is parent-relative, so compose up the hierarchy for the fallback path.
         let jt = modelEntity.jointTransforms
-        let localXforms: [simd_float4x4]
+        let modelSpaceXforms: [simd_float4x4]
         if jt.count == skeleton.joints.count {
-            localXforms = jt.map { $0.matrix }
+            modelSpaceXforms = jt.map { $0.matrix }
         } else {
-            localXforms = skeleton.joints.map { $0.restPoseTransform.matrix }
+            var xforms = [simd_float4x4](repeating: matrix_identity_float4x4, count: skeleton.joints.count)
+            for (i, joint) in skeleton.joints.enumerated() {
+                let local = joint.restPoseTransform.matrix
+                xforms[i] = joint.parentIndex.map { xforms[$0] * local } ?? local
+            }
+            modelSpaceXforms = xforms
         }
 
         return bakeSkinnedGeometry(
@@ -184,31 +188,24 @@ public class GLTFRealityKitExporter {
             normals: normals,
             jointInfluences: jointInf,
             skeleton: skeleton,
-            jointLocalTransforms: localXforms
+            modelSpaceJointTransforms: modelSpaceXforms
         )
     }
 
     /// Applies linear-blend skinning (LBS) to positions and normals, returning deformed geometry.
-    /// jointLocalTransforms are parent-relative, one per joint, ordered parents-before-children.
+    /// modelSpaceJointTransforms must already be in entity-local (model) space, one per joint.
     @available(macOS 15.0, iOS 18.0, *)
     private func bakeSkinnedGeometry(
         positions: [SIMD3<Float>],
         normals: [SIMD3<Float>]?,
         jointInfluences: MeshResource.JointInfluences,
         skeleton: MeshResource.Skeleton,
-        jointLocalTransforms: [simd_float4x4]
+        modelSpaceJointTransforms: [simd_float4x4]
     ) -> (positions: [SIMD3<Float>], normals: [SIMD3<Float>]?) {
-        // Build model-space joint transforms by composing local transforms up the hierarchy.
-        // The skeleton guarantees parents precede children, so single-pass composition is valid.
-        var modelXforms = [simd_float4x4](repeating: matrix_identity_float4x4, count: skeleton.joints.count)
-        for (i, joint) in skeleton.joints.enumerated() {
-            let local = i < jointLocalTransforms.count ? jointLocalTransforms[i] : joint.restPoseTransform.matrix
-            modelXforms[i] = joint.parentIndex.map { modelXforms[$0] * local } ?? local
-        }
-
         // Skinning matrix per joint: brings a vertex from bind-pose model space into current pose model space.
-        let skinMtx: [simd_float4x4] = skeleton.joints.indices.map {
-            modelXforms[$0] * skeleton.joints[$0].inverseBindPoseMatrix
+        let skinMtx: [simd_float4x4] = skeleton.joints.indices.map { i in
+            let M = i < modelSpaceJointTransforms.count ? modelSpaceJointTransforms[i] : matrix_identity_float4x4
+            return M * skeleton.joints[i].inverseBindPoseMatrix
         }
 
         let allInf = jointInfluences.influences.elements
