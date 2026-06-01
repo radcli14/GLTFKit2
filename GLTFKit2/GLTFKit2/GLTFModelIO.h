@@ -1,5 +1,5 @@
 
-#import <GLTFKit2/GLTFAsset.h>
+#import "GLTFAsset.h"
 #import <ModelIO/ModelIO.h>
 
 NS_ASSUME_NONNULL_BEGIN

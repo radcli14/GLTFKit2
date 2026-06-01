@@ -1,6 +1,6 @@
 
 #import "GLTFMeshoptSupport.h"
-#import <GLTFKit2/GLTFAsset.h>
+#import "GLTFAsset.h"
 
 #include <algorithm>
 #include <array>

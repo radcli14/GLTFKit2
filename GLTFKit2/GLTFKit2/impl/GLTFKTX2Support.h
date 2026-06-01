@@ -1,5 +1,5 @@
 
-#import <GLTFKit2/GLTFTypes.h>
+#import "GLTFTypes.h"
 #import <Metal/Metal.h>
 
 NS_ASSUME_NONNULL_BEGIN

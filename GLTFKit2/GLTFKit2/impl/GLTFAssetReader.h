@@ -1,6 +1,6 @@
 
 #import <Foundation/Foundation.h>
-#import <GLTFKit2/GLTFAsset.h>
+#import "GLTFAsset.h"
 
 NS_ASSUME_NONNULL_BEGIN
 

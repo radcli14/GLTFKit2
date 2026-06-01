@@ -3,7 +3,7 @@
 #import <CoreGraphics/CoreGraphics.h>
 #import <Metal/Metal.h>
 
-#import <GLTFKit2/GLTFTypes.h>
+#import "GLTFTypes.h"
 
 NS_ASSUME_NONNULL_BEGIN
 

@@ -1,5 +1,5 @@
 
-#import <GLTFKit2/GLTFAsset.h>
+#import "GLTFAsset.h"
 #import <SceneKit/SceneKit.h>
 
 NS_ASSUME_NONNULL_BEGIN
