@@ -66,6 +66,7 @@ public class GLTFRealityKitExporter {
             if let me = e as? ModelEntity, let model = me.model {
                 wn.meshParts = try buildMeshParts(
                     model: model,
+                    modelEntity: me,
                     rkMaterials: model.materials,
                     materialList: &materials,
                     cache: &materialCache
@@ -86,6 +87,7 @@ public class GLTFRealityKitExporter {
 
     private func buildMeshParts(
         model: ModelComponent,
+        modelEntity: ModelEntity,
         rkMaterials: [any Material],
         materialList: inout [GLTFWriterMaterial],
         cache: inout [ObjectIdentifier: Int]
@@ -101,11 +103,30 @@ public class GLTFRealityKitExporter {
                 let wp = GLTFWriterMeshPart()
                 // SIMD3<Float> has 16-byte stride in memory — must compact to 12-byte packed float3.
                 // Positions and normals are in local mesh space; the node's TRS handles world placement.
-                wp.positionData = packFloat3(positions)
-                wp.vertexCount  = UInt(positions.count)
 
-                if let normals = part.normals?.elements, normals.count == positions.count {
-                    wp.normalData = packFloat3(normals)
+                // Bake skinning deformation into static geometry if joint influences are present.
+                // The exported GLB has no skeleton — just pre-deformed vertices in the current pose.
+                let normals = part.normals?.elements
+                let finalPositions: [SIMD3<Float>]
+                let finalNormals: [SIMD3<Float>]?
+                if #available(macOS 15.0, iOS 18.0, *) {
+                    (finalPositions, finalNormals) = bakeIfSkinned(
+                        positions: positions,
+                        normals: normals,
+                        part: part,
+                        mesh: model.mesh,
+                        modelEntity: modelEntity
+                    )
+                } else {
+                    finalPositions = positions
+                    finalNormals   = normals
+                }
+
+                wp.positionData = packFloat3(finalPositions)
+                wp.vertexCount  = UInt(finalPositions.count)
+
+                if let n = finalNormals, n.count == finalPositions.count {
+                    wp.normalData = packFloat3(n)
                 }
 
                 if let uvs = part.textureCoordinates?.elements, uvs.count == positions.count {
@@ -127,6 +148,101 @@ public class GLTFRealityKitExporter {
             }
         }
         return parts
+    }
+
+    // MARK: - Skinned mesh baking
+
+    /// Returns positions and normals with linear-blend skinning applied, or the originals unchanged
+    /// if the part has no joint influences.
+    @available(macOS 15.0, iOS 18.0, *)
+    private func bakeIfSkinned(
+        positions: [SIMD3<Float>],
+        normals: [SIMD3<Float>]?,
+        part: MeshResource.Part,
+        mesh: MeshResource,
+        modelEntity: ModelEntity
+    ) -> (positions: [SIMD3<Float>], normals: [SIMD3<Float>]?) {
+        guard let jointInf = part.jointInfluences,
+              let skelID   = part.skeletonID,
+              let skeleton = mesh.contents.skeletons[skelID] else {
+            return (positions, normals)
+        }
+
+        // Use the entity's current joint transforms when available (e.g. dynamically posed entity).
+        // Each transform is parent-relative (local joint space), ordered parents-before-children.
+        // Fall back to skeleton rest pose for static models where jointTransforms is empty.
+        let jt = modelEntity.jointTransforms
+        let localXforms: [simd_float4x4]
+        if jt.count == skeleton.joints.count {
+            localXforms = jt.map { $0.matrix }
+        } else {
+            localXforms = skeleton.joints.map { $0.restPoseTransform.matrix }
+        }
+
+        return bakeSkinnedGeometry(
+            positions: positions,
+            normals: normals,
+            jointInfluences: jointInf,
+            skeleton: skeleton,
+            jointLocalTransforms: localXforms
+        )
+    }
+
+    /// Applies linear-blend skinning (LBS) to positions and normals, returning deformed geometry.
+    /// jointLocalTransforms are parent-relative, one per joint, ordered parents-before-children.
+    @available(macOS 15.0, iOS 18.0, *)
+    private func bakeSkinnedGeometry(
+        positions: [SIMD3<Float>],
+        normals: [SIMD3<Float>]?,
+        jointInfluences: MeshResource.JointInfluences,
+        skeleton: MeshResource.Skeleton,
+        jointLocalTransforms: [simd_float4x4]
+    ) -> (positions: [SIMD3<Float>], normals: [SIMD3<Float>]?) {
+        // Build model-space joint transforms by composing local transforms up the hierarchy.
+        // The skeleton guarantees parents precede children, so single-pass composition is valid.
+        var modelXforms = [simd_float4x4](repeating: matrix_identity_float4x4, count: skeleton.joints.count)
+        for (i, joint) in skeleton.joints.enumerated() {
+            let local = i < jointLocalTransforms.count ? jointLocalTransforms[i] : joint.restPoseTransform.matrix
+            modelXforms[i] = joint.parentIndex.map { modelXforms[$0] * local } ?? local
+        }
+
+        // Skinning matrix per joint: brings a vertex from bind-pose model space into current pose model space.
+        let skinMtx: [simd_float4x4] = skeleton.joints.indices.map {
+            modelXforms[$0] * skeleton.joints[$0].inverseBindPoseMatrix
+        }
+
+        let allInf = jointInfluences.influences.elements
+        let vCount = positions.count
+        let ipv    = vCount > 0 ? allInf.count / vCount : 0
+        guard ipv > 0 else { return (positions, normals) }
+
+        var outPos = [SIMD3<Float>](repeating: .zero, count: vCount)
+        var outNrm: [SIMD3<Float>]? = normals != nil ? [SIMD3<Float>](repeating: .zero, count: vCount) : nil
+
+        for v in 0..<vCount {
+            var dp = SIMD4<Float>.zero
+            var dn = SIMD3<Float>.zero
+            for k in 0..<ipv {
+                let idx = v * ipv + k
+                guard idx < allInf.count else { break }
+                let inf = allInf[idx]
+                guard inf.weight > 0, inf.jointIndex < skinMtx.count else { continue }
+                let M = skinMtx[inf.jointIndex]
+                dp += inf.weight * (M * SIMD4<Float>(positions[v].x, positions[v].y, positions[v].z, 1))
+                if let n = normals {
+                    // Upper-left 3×3 of a rigid-body skinning matrix is its rotation — correct for normals.
+                    let R = simd_float3x3(
+                        SIMD3<Float>(M.columns.0.x, M.columns.0.y, M.columns.0.z),
+                        SIMD3<Float>(M.columns.1.x, M.columns.1.y, M.columns.1.z),
+                        SIMD3<Float>(M.columns.2.x, M.columns.2.y, M.columns.2.z)
+                    )
+                    dn += inf.weight * (R * n[v])
+                }
+            }
+            outPos[v] = SIMD3<Float>(dp.x, dp.y, dp.z)
+            if normals != nil { outNrm?[v] = normalize(dn) }
+        }
+        return (outPos, outNrm)
     }
 
     // MARK: - Materials
