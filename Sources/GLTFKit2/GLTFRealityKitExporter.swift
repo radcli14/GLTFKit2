@@ -329,7 +329,7 @@ public class GLTFRealityKitExporter {
         // Explicitly sRGB: CGColorSpaceCreateDeviceRGB() returns the display's native space
         // (Display P3 on wide-color devices), which causes CGImageDestination to apply a
         // P3→sRGB gamut conversion that darkens mid-tone values by ~50%.
-        let colorSpace = CGColorSpaceCreateWithName(CGColorSpace.sRGB)!
+        let colorSpace = CGColorSpace(name: CGColorSpace.sRGB)!
         guard let provider = CGDataProvider(data: Data(bytes) as CFData),
               let cgImage  = CGImage(
                   width: width, height: height,
