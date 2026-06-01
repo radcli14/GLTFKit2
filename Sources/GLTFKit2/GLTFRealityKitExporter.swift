@@ -326,7 +326,10 @@ public class GLTFRealityKitExporter {
     }
 
     private func makePNG(bytes: [UInt8], width: Int, height: Int, bpr: Int) -> Data? {
-        let colorSpace = CGColorSpaceCreateDeviceRGB()
+        // Explicitly sRGB: CGColorSpaceCreateDeviceRGB() returns the display's native space
+        // (Display P3 on wide-color devices), which causes CGImageDestination to apply a
+        // P3→sRGB gamut conversion that darkens mid-tone values by ~50%.
+        let colorSpace = CGColorSpaceCreateWithName(CGColorSpace.sRGB)!
         guard let provider = CGDataProvider(data: Data(bytes) as CFData),
               let cgImage  = CGImage(
                   width: width, height: height,
