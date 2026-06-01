@@ -48,6 +48,13 @@ let package = Package(
             name: "GLTFKit2",
             dependencies: ["GLTFKit2ObjC"],
             path: "Sources/GLTFKit2"
+        ),
+
+        // MARK: Tests
+        .testTarget(
+            name: "GLTFKit2Tests",
+            dependencies: ["GLTFKit2"],
+            path: "Tests/GLTFKit2Tests"
         )
     ]
 )

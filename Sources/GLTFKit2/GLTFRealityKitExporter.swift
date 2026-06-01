@@ -326,10 +326,11 @@ public class GLTFRealityKitExporter {
     }
 
     private func makePNG(bytes: [UInt8], width: Int, height: Int, bpr: Int) -> Data? {
-        // Explicitly sRGB: CGColorSpaceCreateDeviceRGB() returns the display's native space
-        // (Display P3 on wide-color devices), which causes CGImageDestination to apply a
-        // P3→sRGB gamut conversion that darkens mid-tone values by ~50%.
-        let colorSpace = CGColorSpace(name: CGColorSpace.sRGB)!
+        // Use linearSRGB so the CGImage is declared as already-linear.
+        // TextureResource.generate(from:options:.color) converts sRGB-tagged input to linear,
+        // darkening mid-tone values by ~50%. Declaring the source as linearSRGB tells RealityKit
+        // the values are already linear and skips that conversion, preserving Metal readback values.
+        let colorSpace = CGColorSpace(name: CGColorSpace.linearSRGB)!
         guard let provider = CGDataProvider(data: Data(bytes) as CFData),
               let cgImage  = CGImage(
                   width: width, height: height,
