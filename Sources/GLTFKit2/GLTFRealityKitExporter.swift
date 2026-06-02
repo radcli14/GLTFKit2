@@ -168,19 +168,19 @@ public class GLTFRealityKitExporter {
             return (positions, normals)
         }
 
-        // jointTransforms are PARENT-RELATIVE (local space), not model-space.
-        // Compose up the skeleton hierarchy to get model-space transforms for LBS.
-        // Fall back to restPoseTransform (also parent-relative) when joint count doesn't match.
+        // jointTransforms are MODEL-SPACE (relative to the model entity), not parent-relative.
+        // Use them directly for LBS. Only restPoseTransform is parent-relative and needs composition.
         let jt = modelEntity.jointTransforms
-        let localXforms: [simd_float4x4]
+        let modelSpaceXforms: [simd_float4x4]
         if jt.count == skeleton.joints.count {
-            localXforms = jt.map { $0.matrix }
+            modelSpaceXforms = jt.map { $0.matrix }
         } else {
-            localXforms = skeleton.joints.map { $0.restPoseTransform.matrix }
-        }
-        var modelSpaceXforms = [simd_float4x4](repeating: matrix_identity_float4x4, count: skeleton.joints.count)
-        for (i, joint) in skeleton.joints.enumerated() {
-            modelSpaceXforms[i] = joint.parentIndex.map { modelSpaceXforms[$0] * localXforms[i] } ?? localXforms[i]
+            var composed = [simd_float4x4](repeating: matrix_identity_float4x4, count: skeleton.joints.count)
+            for (i, joint) in skeleton.joints.enumerated() {
+                let local = joint.restPoseTransform.matrix
+                composed[i] = joint.parentIndex.map { composed[$0] * local } ?? local
+            }
+            modelSpaceXforms = composed
         }
 
         return bakeSkinnedGeometry(

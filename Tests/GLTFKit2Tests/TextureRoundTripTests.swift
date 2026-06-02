@@ -619,14 +619,19 @@ private func expectedBakedPositions(from entity: Entity) -> [SIMD3<Float>] {
                     if let ji = part.jointInfluences,
                        let skelID = part.skeletonID,
                        let skel = model.mesh.contents.skeletons[skelID] {
-                        // jointTransforms are parent-relative — compose up the hierarchy to model-space.
+                        // jointTransforms are model-space (relative to the model entity), use directly.
+                        // Only restPoseTransform is parent-relative and needs hierarchy composition.
                         let jt = me.jointTransforms
-                        let localXforms: [simd_float4x4] = jt.count == skel.joints.count
-                            ? jt.map { $0.matrix }
-                            : skel.joints.map { $0.restPoseTransform.matrix }
-                        var modelSpaceXforms = [simd_float4x4](repeating: matrix_identity_float4x4, count: skel.joints.count)
-                        for (i, joint) in skel.joints.enumerated() {
-                            modelSpaceXforms[i] = joint.parentIndex.map { modelSpaceXforms[$0] * localXforms[i] } ?? localXforms[i]
+                        let modelSpaceXforms: [simd_float4x4]
+                        if jt.count == skel.joints.count {
+                            modelSpaceXforms = jt.map { $0.matrix }
+                        } else {
+                            var composed = [simd_float4x4](repeating: matrix_identity_float4x4, count: skel.joints.count)
+                            for (i, joint) in skel.joints.enumerated() {
+                                let local = joint.restPoseTransform.matrix
+                                composed[i] = joint.parentIndex.map { composed[$0] * local } ?? local
+                            }
+                            modelSpaceXforms = composed
                         }
                         result.append(contentsOf: applyLBS(positions: positions, influences: ji,
                                                            skeleton: skel, modelSpaceTransforms: modelSpaceXforms))
@@ -760,17 +765,12 @@ func testSkinnedBakingLeftHand() async throws {
         for (a, b) in zip(bindPositions, restBaked) { maxRestErr = max(maxRestErr, length(a - b)) }
         print("Rest-pose LBS identity check (restPoseTransform vs bind-pose): maxError=\(maxRestErr) m")
 
-        // Compose jointTransforms (parent-relative) up the hierarchy → model-space, then apply LBS.
-        // This is the same computation the exporter now uses. The resulting AABB should match
-        // the "Expected AABB" printed below (since both use the same composed model-space transforms).
+        // Apply LBS using jointTransforms directly (model-space). Should match Expected AABB below.
         if jt.count == skel.joints.count {
-            var composedJt = [simd_float4x4](repeating: matrix_identity_float4x4, count: skel.joints.count)
-            for (i, joint) in skel.joints.enumerated() {
-                composedJt[i] = joint.parentIndex.map { composedJt[$0] * jt[i].matrix } ?? jt[i].matrix
-            }
-            let composedBaked = applyLBS(positions: bindPositions, influences: ji, skeleton: skel, modelSpaceTransforms: composedJt)
-            if let bb = aabb(of: composedBaked) {
-                print("Composed-jt LBS AABB: size=\(bb.max - bb.min)  min=\(bb.min)")
+            let directBaked = applyLBS(positions: bindPositions, influences: ji, skeleton: skel,
+                                       modelSpaceTransforms: jt.map { $0.matrix })
+            if let bb = aabb(of: directBaked) {
+                print("Direct-jt LBS AABB: size=\(bb.max - bb.min)  min=\(bb.min)")
             }
         }
     }
@@ -800,6 +800,14 @@ func testSkinnedBakingLeftHand() async throws {
         let maxDimDiff = max(abs(expSize2.x - bindSize.x), abs(expSize2.y - bindSize.y), abs(expSize2.z - bindSize.z))
         #expect(maxDimDiff > 0.001 || expPos == bindPos,
                 "LBS baking produced no change from bind pose — jointTransforms may be identity or skinning is not running")
+
+        // A natural pose (e.g. a fist) cannot have a larger volume than the spread-hand bind pose
+        // by more than 8×. If it does, LBS is compounding transforms by treating model-space
+        // jointTransforms as parent-relative and composing them up the hierarchy.
+        let bindVol = bindSize.x * bindSize.y * bindSize.z
+        let expVol  = expSize2.x * expSize2.y * expSize2.z
+        #expect(expVol < bindVol * 8,
+                "Baked volume (\(expVol) m³) is >8× bind-pose volume (\(bindVol) m³) — jointTransforms are likely being composed incorrectly")
     }
 
     // Bounding box comparison: checks both size (shape) and position (origin offset).
