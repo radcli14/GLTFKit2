@@ -730,8 +730,19 @@ func testSkinnedBakingLeftHand() async throws {
             restXforms[i] = joint.parentIndex.map { restXforms[$0] * local } ?? local
         }
 
-        // Print first 4 joints: compare restPose, invBind, and live jointTransforms translations + rotations.
+        // Check if jointNames and skeleton.joints are in the same order.
         let jt = me.jointTransforms
+        let jn = me.jointNames
+        print("--- Joint Name Ordering Check ---")
+        print("  skeleton.joints.count=\(skel.joints.count)  jointTransforms.count=\(jt.count)  jointNames.count=\(jn.count)")
+        for i in 0..<min(6, skel.joints.count) {
+            let skelName = skel.joints[i].name
+            let jtName   = i < jn.count ? jn[i] : "(out of range)"
+            let match    = skelName == jtName ? "✓" : "✗ MISMATCH"
+            print("  [\(i)] skel='\(skelName)'  jt='\(jtName)'  \(match)")
+        }
+
+        // Print first 4 joints: compare restPose, invBind, and live jointTransforms translations + rotations.
         let invBindXforms = skel.joints.map { simd_inverse($0.inverseBindPoseMatrix) }
         print("--- Joint Coordinate Comparison ---")
         for i in 0..<min(4, skel.joints.count) {
@@ -764,14 +775,52 @@ func testSkinnedBakingLeftHand() async throws {
         var maxRestErr: Float = 0
         for (a, b) in zip(bindPositions, restBaked) { maxRestErr = max(maxRestErr, length(a - b)) }
         print("Rest-pose LBS identity check (restPoseTransform vs bind-pose): maxError=\(maxRestErr) m")
+        if let bb = aabb(of: restBaked) {
+            print("compose(restPoseTransform) LBS AABB: size=\(bb.max - bb.min)  min=\(bb.min)")
+        }
 
-        // Apply LBS using jointTransforms directly (model-space). Should match Expected AABB below.
+        // Compose jointTransforms up the hierarchy (parent-relative interpretation).
         if jt.count == skel.joints.count {
+            var composedJT = [simd_float4x4](repeating: matrix_identity_float4x4, count: skel.joints.count)
+            for (i, joint) in skel.joints.enumerated() {
+                composedJT[i] = joint.parentIndex.map { composedJT[$0] * jt[i].matrix } ?? jt[i].matrix
+            }
+            let composedJTBaked = applyLBS(positions: bindPositions, influences: ji, skeleton: skel,
+                                           modelSpaceTransforms: composedJT)
+            if let bb = aabb(of: composedJTBaked) {
+                print("compose(jointTransforms) LBS AABB: size=\(bb.max - bb.min)  min=\(bb.min)")
+            }
+
+            // Apply LBS using jointTransforms directly (treating as model-space).
             let directBaked = applyLBS(positions: bindPositions, influences: ji, skeleton: skel,
                                        modelSpaceTransforms: jt.map { $0.matrix })
             if let bb = aabb(of: directBaked) {
                 print("Direct-jt LBS AABB: size=\(bb.max - bb.min)  min=\(bb.min)")
             }
+        }
+
+        // Check for SkeletalPosesComponent which may expose named poses.
+        func findSkeletalPoses(_ e: Entity) {
+            if let comp = e.components[SkeletalPosesComponent.self] {
+                let poseSummary = comp.poses.map { "\($0.id) (\($0.jointTransforms.count) joints)" }
+                print("SkeletalPosesComponent on '\(e.name)': poses=\(poseSummary)")
+                // Print first pose's first few joint transforms for comparison.
+                if let first = comp.poses.first {
+                    print("  First pose '\(first.id)' jointTransforms[0..<3]:")
+                    for i in 0..<min(3, first.jointTransforms.count) {
+                        let jt = first.jointTransforms[first.jointTransforms.index(first.jointTransforms.startIndex, offsetBy: i)]
+                        print("    [\(i)] t=\(jt.translation)")
+                    }
+                }
+            }
+            for child in e.children { findSkeletalPoses(child) }
+        }
+        findSkeletalPoses(source)
+
+        // Print first 5 bind-pose vertex positions to see what shape the raw mesh forms.
+        print("First 5 bind-pose vertex positions:")
+        for (i, p) in bindPositions.prefix(5).enumerated() {
+            print("  [\(i)] \(p)")
         }
     }
 
@@ -845,13 +894,8 @@ func testSkinnedBakingLeftHand() async throws {
 /// Verifies that texture wrapping modes (wrapS/wrapT) survive a GLB round-trip.
 ///
 /// The DamagedHelmet's base color texture uses GL_REPEAT (wrapS/wrapT = 10497 = 0x2901)
-/// because UV coordinates extend outside [0, 1]. GLTFAssetWriter.m currently hardcodes
-/// CLAMP_TO_EDGE (33071 = 0x812F) for all exported samplers, which causes any UV < 0
-/// or > 1 to sample the edge pixel instead of tiling — producing the near-black
-/// appearance observed in the round-trip render.
-///
-/// This test is expected to FAIL until GLTFAssetWriter.m propagates the source
-/// sampler's wrapS/wrapT instead of hardcoding CLAMP_TO_EDGE.
+/// because UV coordinates extend outside [0, 1]. GLTFAssetWriter.m exports all samplers
+/// with GL_REPEAT as the default, matching this expectation.
 @Test @MainActor func testTextureWrappingModeRoundTrip() async throws {
     let data = try await HelmetCache.shared.data()
     let source = try await loadEntity(from: data)
@@ -887,8 +931,8 @@ func testSkinnedBakingLeftHand() async throws {
         let ldWrapS  = ld.wrapS.rawValue,  ldWrapT  = ld.wrapT.rawValue
         print("wrapS: src=\(srcWrapS), loaded=\(ldWrapS)  (REPEAT=10497, CLAMP=33071)")
         print("wrapT: src=\(srcWrapT), loaded=\(ldWrapT)  (REPEAT=10497, CLAMP=33071)")
-        #expect(ld.wrapS == src.wrapS, "wrapS mismatch: src=\(srcWrapS) REPEAT=10497, loaded=\(ldWrapS) CLAMP=33071 — GLTFAssetWriter.m hardcodes CLAMP_TO_EDGE")
-        #expect(ld.wrapT == src.wrapT, "wrapT mismatch: src=\(srcWrapT) REPEAT=10497, loaded=\(ldWrapT) CLAMP=33071 — GLTFAssetWriter.m hardcodes CLAMP_TO_EDGE")
+        #expect(ld.wrapS == src.wrapS, "wrapS mismatch: src=\(srcWrapS) (REPEAT=10497), loaded=\(ldWrapS)")
+        #expect(ld.wrapT == src.wrapT, "wrapT mismatch: src=\(srcWrapT) (REPEAT=10497), loaded=\(ldWrapT)")
     }
 }
 
